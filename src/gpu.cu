@@ -861,7 +861,7 @@ __launch_bounds__(block_dim_x) void kernel(InputBuffer<SeedPos> inputs, OutputBu
           conv += conv_z[1][dnx][hoisted_idx_xy[1][dnx] + nz_masked];
         }
 
-        if (conv > -19.5f) {
+        if (conv > -20.0f) {
           uint32_t result_index = atomicAdd(outputs.len, 1);
           if (result_index < outputs.max_len) {
             outputs.data[result_index] = {input.seed_index, x, z};
@@ -1113,7 +1113,7 @@ void Template<NoiseThreshold, Octaves, PosRange, Samples, MinCount, FlippedSpars
 
 // cactus was here :)
 namespace KernelFilter2_0A {
-using T = KernelFilter2::Template<-5500, 3, 8 * 1024, 256, 28, false, false, true>;
+using T = KernelFilter2::Template<-5500, 3, 8 * 1024, 256, 27, false, false, true>;
 
 static_assert(T::samples == 256);
 static_assert(T::samples_square_size == 16);
@@ -1178,8 +1178,8 @@ __global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos>
   ImprovedNoise &oct0 = s_oct0[warp_in_block];
   ImprovedNoise &oct1 = s_oct1[warp_in_block];
 
-  const uint32_t z_index = lane >> 1;        // 0..15
-  const uint32_t x_start = (lane & 1u) * 8u; // 0 orr 8
+  const uint32_t z_index = lane >> 1;
+  const uint32_t x_start = (lane & 1u) * 8u;
 
   constexpr uint32_t words = sizeof(ImprovedNoise) / sizeof(uint32_t);
 
@@ -1279,6 +1279,172 @@ void run(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1
 }
 } // namespace KernelFilter2_0A
 
+namespace KernelFilter2_0B {
+using T = KernelFilter2::Template<-5500, 3, 8 * 1024, 256, 20, false, false, false>;
+
+static_assert(T::samples == 256);
+static_assert(T::samples_square_size == 16);
+static_assert(!T::samples_square_sparse);
+static_assert(T::octaves == 3 && !T::only_a);
+static_assert(!T::move_center);
+
+constexpr uint32_t threads_per_block = 256;
+constexpr uint32_t warps_per_block = threads_per_block / 32;
+
+constexpr OctaveConfig cfg0 = chosen_continentalness_config.octaves_b[0];
+constexpr OctaveConfig cfg1 = chosen_continentalness_config.octaves_b[1];
+constexpr float if0 = (float)cfg0.input_factor;
+constexpr float if1 = (float)cfg1.input_factor;
+constexpr float vf0 = (float)cfg0.value_factor;
+constexpr float vf1 = (float)cfg1.value_factor;
+
+__device__ inline void compute_cell(const ImprovedNoise &noise, int32_t int_x, int32_t int_y, int32_t int_z, uint8_t &c000, uint8_t &c100, uint8_t &c010, uint8_t &c110, uint8_t &c001, uint8_t &c101, uint8_t &c011, uint8_t &c111) {
+  uint8_t p0 = noise.p[(int_x) & 0xFF];
+  uint8_t p1 = noise.p[(int_x + 1) & 0xFF];
+  uint8_t p00 = noise.p[(p0 + int_y) & 0xFF];
+  uint8_t p01 = noise.p[(p0 + int_y + 1) & 0xFF];
+  uint8_t p10 = noise.p[(p1 + int_y) & 0xFF];
+  uint8_t p11 = noise.p[(p1 + int_y + 1) & 0xFF];
+  c000 = noise.p[(p00 + int_z) & 0xFF];
+  c100 = noise.p[(p10 + int_z) & 0xFF];
+  c010 = noise.p[(p01 + int_z) & 0xFF];
+  c110 = noise.p[(p11 + int_z) & 0xFF];
+  c001 = noise.p[(p00 + int_z + 1) & 0xFF];
+  c101 = noise.p[(p10 + int_z + 1) & 0xFF];
+  c011 = noise.p[(p01 + int_z + 1) & 0xFF];
+  c111 = noise.p[(p11 + int_z + 1) & 0xFF];
+}
+
+__device__ inline float interp(const GradDotTable &table, float frac_x, float frac_y, float frac_z, float fx, float fy, float fz, uint8_t c000, uint8_t c100, uint8_t c010, uint8_t c110, uint8_t c001, uint8_t c101, uint8_t c011, uint8_t c111) {
+  float n000 = gradDot(table, c000, frac_x, frac_y, frac_z);
+  float n100 = gradDot(table, c100, frac_x - 1.0f, frac_y, frac_z);
+  float n010 = gradDot(table, c010, frac_x, frac_y - 1.0f, frac_z);
+  float n110 = gradDot(table, c110, frac_x - 1.0f, frac_y - 1.0f, frac_z);
+  float n001 = gradDot(table, c001, frac_x, frac_y, frac_z - 1.0f);
+  float n101 = gradDot(table, c101, frac_x - 1.0f, frac_y, frac_z - 1.0f);
+  float n011 = gradDot(table, c011, frac_x, frac_y - 1.0f, frac_z - 1.0f);
+  float n111 = gradDot(table, c111, frac_x - 1.0f, frac_y - 1.0f, frac_z - 1.0f);
+  return lerp3(fx, fy, fz, n000, n100, n010, n110, n001, n101, n011, n111);
+}
+
+__global__ __launch_bounds__(threads_per_block) void kernel(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results) {
+  __shared__ GradDotTable shared_grad_dot_table;
+  __shared__ ImprovedNoise s_oct0[warps_per_block];
+  __shared__ ImprovedNoise s_oct1[warps_per_block];
+
+  for (uint32_t i = threadIdx.x; i < sizeof(shared_grad_dot_table) / sizeof(uint32_t); i += threads_per_block) {
+    reinterpret_cast<uint32_t *>(&shared_grad_dot_table)[i] = reinterpret_cast<uint32_t *>(&device_grad_dot_table)[i];
+  }
+  __syncthreads();
+
+  const uint32_t lane = threadIdx.x & 31u;
+  const uint32_t warp_in_block = threadIdx.x >> 5;
+  const uint32_t warp_global = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const uint32_t num_warps = (gridDim.x * blockDim.x) >> 5;
+
+  ImprovedNoise &oct0 = s_oct0[warp_in_block];
+  ImprovedNoise &oct1 = s_oct1[warp_in_block];
+
+  const uint32_t z_index = lane >> 1;
+  const uint32_t x_start = (lane & 1u) * 8u;
+
+  constexpr uint32_t words = sizeof(ImprovedNoise) / sizeof(uint32_t);
+
+  uint32_t inputs_len = *inputs.len;
+  for (uint32_t input_index = warp_global; input_index < inputs_len; input_index += num_warps) {
+    const SeedPos input = inputs.data[input_index];
+    const uint32_t seed_index = input.seed_index;
+
+    {
+      const uint32_t *src0 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_0B);
+      const uint32_t *src1 = reinterpret_cast<const uint32_t *>(&results[seed_index].continentalness_1B);
+      uint32_t *dst0 = reinterpret_cast<uint32_t *>(&oct0);
+      uint32_t *dst1 = reinterpret_cast<uint32_t *>(&oct1);
+      for (uint32_t i = lane; i < words; i += 32) {
+        dst0[i] = src0[i];
+        dst1[i] = src1[i];
+      }
+    }
+    __syncwarp();
+
+    const int32_t z_world = input.z + (int32_t)(z_index * T::pos_step) + T::pos_offset;
+    const int32_t x_base = input.x + (int32_t)(x_start * T::pos_step) + T::pos_offset;
+
+    const float y0 = oct0.yo;
+    const int32_t int_y0 = __float2int_rd(y0);
+    const float frac_y0 = y0 - (float)int_y0;
+    const float fy0 = smoothstep(frac_y0);
+    const float z0c = z_world * if0 + oct0.zo;
+    const int32_t int_z0 = __float2int_rd(z0c);
+    const float frac_z0 = z0c - (float)int_z0;
+    const float fz0 = smoothstep(frac_z0);
+    const float y1 = oct1.yo;
+    const int32_t int_y1 = __float2int_rd(y1);
+    const float frac_y1 = y1 - (float)int_y1;
+    const float fy1 = smoothstep(frac_y1);
+    const float z1c = z_world * if1 + oct1.zo;
+    const int32_t int_z1 = __float2int_rd(z1c);
+    const float frac_z1 = z1c - (float)int_z1;
+    const float fz1 = smoothstep(frac_z1);
+
+    int32_t cur_ix0 = 0;
+    int32_t cur_ix1 = 0;
+    bool have0 = false;
+    bool have1 = false;
+    uint8_t a000, a100, a010, a110, a001, a101, a011, a111;
+    uint8_t b000, b100, b010, b110, b001, b101, b011, b111;
+
+    uint32_t local_count = 0;
+#pragma unroll
+    for (uint32_t k = 0; k < 8; k++) {
+      const int32_t x_world = x_base + (int32_t)(k * T::pos_step);
+
+      const float x0c = x_world * if0 + oct0.xo;
+      const int32_t int_x0 = __float2int_rd(x0c);
+      const float frac_x0 = x0c - (float)int_x0;
+      if (!have0 || int_x0 != cur_ix0) {
+        compute_cell(oct0, int_x0, int_y0, int_z0, a000, a100, a010, a110, a001, a101, a011, a111);
+        cur_ix0 = int_x0;
+        have0 = true;
+      }
+      const float fx0 = smoothstep(frac_x0);
+      const float noise0 = interp(shared_grad_dot_table, frac_x0, frac_y0, frac_z0, fx0, fy0, fz0, a000, a100, a010, a110, a001, a101, a011, a111);
+
+      const float x1c = x_world * if1 + oct1.xo;
+      const int32_t int_x1 = __float2int_rd(x1c);
+      const float frac_x1 = x1c - (float)int_x1;
+      if (!have1 || int_x1 != cur_ix1) {
+        compute_cell(oct1, int_x1, int_y1, int_z1, b000, b100, b010, b110, b001, b101, b011, b111);
+        cur_ix1 = int_x1;
+        have1 = true;
+      }
+      const float fx1 = smoothstep(frac_x1);
+      const float noise1 = interp(shared_grad_dot_table, frac_x1, frac_y1, frac_z1, fx1, fy1, fz1, b000, b100, b010, b110, b001, b101, b011, b111);
+
+      float val = 0;
+      val += noise0 * vf0;
+      val += noise1 * vf1;
+
+      local_count += (val < T::noise_threshold) ? 1u : 0u;
+    }
+
+    const uint32_t total = warp_reduce_add(local_count);
+    if (lane == 0 && total >= T::min_count) {
+      uint32_t result_index = atomicAdd(outputs.len, 1);
+      if (result_index < outputs.max_len){
+        outputs.data[result_index] = {seed_index, input.x, input.z};
+      }
+    }
+    __syncwarp();
+  }
+}
+
+void run(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results, cudaStream_t stream) {
+  kernel<<<32 * 256, threads_per_block, 0, stream>>>(inputs, outputs, results);
+  TRY_CUDA(cudaGetLastError());
+}
+} // namespace KernelFilter2_0B
+
 struct CudaEventWrapper {
   cudaEvent_t event;
 
@@ -1371,10 +1537,11 @@ struct BufferLens {
   uint32_t results_len_filter_seeds;
   uint32_t results_len_filter_gradvecs_1;
   uint32_t results_len_filter_2_0a;
+  uint32_t results_len_filter_2_0b;
   uint32_t results_len_filter_gradvecs_2;
-  // uint32_t results_len_filter_1;
   uint32_t results_len_filter_2[7];
 };
+
 
 GpuThread::GpuThread(int device, SeedIterator &input, GpuOutputs &outputs)
     : Thread(), device(device), input(input), outputs(outputs) {
@@ -1424,6 +1591,9 @@ void GpuThread::run() {
   OutputBuffer<SeedPos> outputs_filter_gradvecs_2(buffer_2, &device_buffer_lens->results_len_filter_gradvecs_2);
   auto &stage_filter_gradvecs_2 = stage_stats.emplace_back("filter_gradvecs_2", stage_filter_2_0a.outputs_len, &host_buffer_lens.results_len_filter_gradvecs_2, KernelFilterGradVecs2::threads_per_seed, outputs_filter_gradvecs_2.max_len);
 
+  OutputBuffer<SeedPos> outputs_filter_2_0b(buffer_2, &device_buffer_lens->results_len_filter_2_0b);
+  auto &stage_filter_2_0b = stage_stats.emplace_back("filter_2_01b", stage_filter_gradvecs_2.outputs_len, &host_buffer_lens.results_len_filter_2_0b, 1, outputs_filter_2_0b.max_len);
+
   using Kernel2RunFunc = void (*)(InputBuffer<SeedPos> inputs, OutputBuffer<SeedPos> outputs, KernelSeed1::Result *results, cudaStream_t stream);
   struct Filter2Stage {
     Kernel2RunFunc run;
@@ -1433,18 +1603,19 @@ void GpuThread::run() {
     Filter2Stage(Kernel2RunFunc run, OutputBuffer<SeedPos> outputs, StageStats &stage)
         : run(run), outputs(outputs), stage(stage) {}
   };
-  // 1.1a Filter 2 mod (cactus edition)
+  
   Kernel2RunFunc filter_2_0A_run = KernelFilter2_0A::run;
+  Kernel2RunFunc filter_2_0B_run = KernelFilter2_0B::run;
 
   Kernel2RunFunc filter_2_runs[] = {
       KernelFilter2::Template<-10500, 12, 8 * 1024, 256, 24, false, true, false>::run, 
-      KernelFilter2::Template<-10500, 14, 8 * 1024, 1024, 110, false, true, false>::run, 
-      KernelFilter2::Template<-10500, 18, 10 * 1024, 16384, 1440, false, false, false>::run, // zajonc was here :D, use 1560 instead of 1440 because of colab shitty cpus
+      KernelFilter2::Template<-10500, 14, 8 * 1024, 1024, 110, false, true, false>::run,
+      KernelFilter2::Template<-10500, 18, 10 * 1024, 4096, 340, false, false, false>::run,
+      KernelFilter2::Template<-10500, 18, 10 * 1024, 16384, 1440, false, false, false>::run, // zajonc was here :D, use 1565 instead of 1440 because of colab shitty cpus
   };
   std::vector<Filter2Stage> filter_2;
   {
-    // uint32_t *inputs_len = stage_filter_1.outputs_len;
-    uint32_t *inputs_len = stage_filter_gradvecs_2.outputs_len;
+    uint32_t *inputs_len = stage_filter_2_0b.outputs_len;
     for (size_t i = 0; i < sizeof(filter_2_runs) / sizeof(*filter_2_runs); i++) {
       OutputBuffer<SeedPos> outputs(i % 2 == 0 ? buffer_1 : buffer_2, &device_buffer_lens->results_len_filter_2[i]);
 
@@ -1456,7 +1627,7 @@ void GpuThread::run() {
     }
   }
 
-  int print_interval = 1024;
+  int print_interval = 256;
 
   auto start = std::chrono::steady_clock::now();
 
@@ -1483,13 +1654,13 @@ void GpuThread::run() {
     KernelFilterGradVecs2::run(outputs_filter_2_0a, outputs_filter_gradvecs_2, results, stream);
     stage_filter_gradvecs_2.record(stream);
 
-    // Filter1::run(outputs_filter_seeds, outputs_filter_1);
-    // stage_filter_1.record(stream);
+    filter_2_0B_run(outputs_filter_gradvecs_2, outputs_filter_2_0b, results, stream);
+    stage_filter_2_0b.record(stream);
 
     {
-      // OutputBuffer<SeedPos> *inputs = &outputs_filter_1;
-      OutputBuffer<SeedPos> *inputs = &outputs_filter_gradvecs_2;
+      OutputBuffer<SeedPos> *inputs = &outputs_filter_2_0b;
       for (auto &filter : filter_2) {
+
         filter.run(*inputs, filter.outputs, results, stream);
         filter.stage.record(stream);
         inputs = &filter.outputs;
@@ -1504,6 +1675,8 @@ void GpuThread::run() {
     host_buffer_lens.results_len_filter_gradvecs_1 = std::min(host_buffer_lens.results_len_filter_gradvecs_1, outputs_filter_gradvecs_1.max_len);
     host_buffer_lens.results_len_filter_2_0a = std::min(host_buffer_lens.results_len_filter_2_0a, outputs_filter_2_0a.max_len);
     host_buffer_lens.results_len_filter_gradvecs_2 = std::min(host_buffer_lens.results_len_filter_gradvecs_2, outputs_filter_gradvecs_2.max_len);
+    host_buffer_lens.results_len_filter_2_0b = std::min(host_buffer_lens.results_len_filter_2_0b, outputs_filter_2_0b.max_len);
+
     for (size_t k = 0; k < filter_2.size(); k++) {
       host_buffer_lens.results_len_filter_2[k] = std::min(host_buffer_lens.results_len_filter_2[k], filter_2[k].outputs.max_len);
     }
@@ -1525,14 +1698,10 @@ void GpuThread::run() {
       TRY_CUDA(cudaMemcpy(h_buffer.data(), final_outputs.data, sizeof(*h_buffer.data()) * len, cudaMemcpyDeviceToHost));
 
       {
-        // auto lock_start = std::chrono::steady_clock::now();
         std::lock_guard lock(outputs.mutex);
         for (const auto &result : h_buffer) {
           uint64_t seed;
           TRY_CUDA(cudaMemcpy(&seed, &outputs_filter_seeds.data[result.seed_index], sizeof(seed), cudaMemcpyDeviceToHost));
-          // std::printf("seed = %" PRIi64 " seed_index = %" PRIu32 " x = %"
-          // PRIi32 " z = %" PRIi32 "\n", seed, result.seed_index, result.x,
-          // result.z);
           outputs.queue.push({seed, result.x * 4, result.z * 4});
         }
       }
