@@ -1866,7 +1866,7 @@ void GpuThread::run() {
         uint64_t scaled_total_inputs = stage.total_inputs * stage.inputs_multiplier;
         auto [scaled_input_speed, input_speed_unit] = scale_si(scaled_total_inputs / stage.total_time);
         auto [scaled_output_speed, output_speed_unit] = scale_si(stage.total_outputs / stage.total_time);
-        std::printf("%-20s - %9.3f ms | %7.3f %% | %12" PRIu64 " -> %12" PRIu64
+        std::printf("%-20s - %9.3f ms | %7.3f %% | %16" PRIu64 " -> %12" PRIu64
                     " | 1 in %11.3f | %7.3f %cips | %7.3f %cops\n",
                     stage.name.c_str(), stage.total_time * 1e3,
                     stage.total_time / host_total_time * 100.0,
@@ -1882,7 +1882,7 @@ void GpuThread::run() {
       auto [scaled_input_speed, input_speed_unit] = scale_si(total_inputs / host_total_time);
       auto [scaled_output_speed, output_speed_unit] = scale_si(total_outputs / host_total_time);
       std::printf(
-          "total                - %9.3f ms | %7.3f %% | %12" PRIu64
+          "total                - %9.3f ms | %7.3f %% | %16" PRIu64
           " -> %12" PRIu64 " |                  | %7.3f %cips | %7.3f %cops\n",
           host_total_time * 1e3, kernel_total_time / host_total_time * 100.0,
           total_inputs, total_outputs, scaled_input_speed, input_speed_unit,
