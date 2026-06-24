@@ -20,11 +20,17 @@
 #include <charconv>
 #include <algorithm>
 #include <random>
+#include <unistd.h>
 
 static std::atomic_bool running{true};
+static std::atomic_uint32_t signal_count{0};
 
 static void signal_handler(int) {
+    uint32_t count = signal_count.fetch_add(1, std::memory_order_relaxed) + 1;
     running.store(false, std::memory_order_relaxed);
+    if (count >= 2) {
+        _exit(130);
+    }
 }
 
 #ifdef NO_GPU
@@ -274,7 +280,22 @@ int main_inner(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
+    size_t pending_cpu_inputs = 0;
+    {
+        std::lock_guard lock(gpu_outputs.mutex);
+        pending_cpu_inputs = gpu_outputs.queue.size();
+    }
+    size_t pending_cpu_outputs = 0;
+    {
+        std::lock_guard lock(cpu_outputs.mutex);
+        pending_cpu_outputs = cpu_outputs.queue.size();
+    }
+
     std::printf("\nShutting down...\n");
+    if (pending_cpu_inputs > 0 || pending_cpu_outputs > 0) {
+        std::printf("Pending CPU input queue: %zu, pending CPU output queue: %zu\n", pending_cpu_inputs, pending_cpu_outputs);
+    }
+    std::printf("Press Ctrl+C again to force exit immediately.\n");
 
 #ifndef NO_GPU
     for (auto &thread : gpu_threads) {
@@ -291,7 +312,7 @@ int main_inner(int argc, char **argv) {
         (*client_thread).stop();
     }
     if (server_thread) {
-        (*server_thread).stop();
+        (*server_thread).shutdown();
     }
 #endif
 
@@ -308,6 +329,16 @@ int main_inner(int argc, char **argv) {
 #ifndef NO_CPU
     for (auto &thread : cpu_threads) {
         (*thread).join();
+    }
+    {
+        std::lock_guard lock(cpu_outputs.mutex);
+        while (!cpu_outputs.queue.empty()) {
+            auto output = cpu_outputs.queue.front();
+            cpu_outputs.queue.pop();
+            std::printf("%" PRIi64 " at %" PRIi32 " %" PRIi32 " with %" PRIi32 "\n", output.seed, output.x, output.z, output.score);
+            std::fprintf(output_file, "%" PRIi64 " %" PRIi32 " %" PRIi32 " %" PRIi32 "\n", output.seed, output.x, output.z, output.score);
+            std::fflush(output_file);
+        }
     }
 #endif
 #ifndef NO_NET
