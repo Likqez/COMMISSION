@@ -280,14 +280,6 @@ int main_inner(int argc, char **argv) {
     for (auto &thread : gpu_threads) {
         (*thread).stop();
     }
-    std::printf("Waiting for GPU batches to finish...\n");
-    for (auto &thread : gpu_threads) {
-        (*thread).join();
-    }
-    {
-        uint64_t total_seeds_checked = seed_range.pos.load(std::memory_order_relaxed) - start_seed;
-        std::printf("Start seed: %" PRIi64 ", Total seeds checked: %" PRIu64 "\n", start_seed, total_seeds_checked);
-    }
 #endif
 #ifndef NO_CPU
     for (auto &thread : cpu_threads) {
@@ -303,6 +295,16 @@ int main_inner(int argc, char **argv) {
     }
 #endif
 
+#ifndef NO_GPU
+    std::printf("Waiting for GPU batches to finish...\n");
+    for (auto &thread : gpu_threads) {
+        (*thread).join();
+    }
+    {
+        uint64_t total_seeds_checked = seed_range.pos.load(std::memory_order_relaxed) - start_seed;
+        std::printf("Start seed: %" PRIi64 ", Total seeds checked: %" PRIu64 "\n", start_seed, total_seeds_checked);
+    }
+#endif
 #ifndef NO_CPU
     for (auto &thread : cpu_threads) {
         (*thread).join();
