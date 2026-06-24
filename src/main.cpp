@@ -14,11 +14,18 @@
 #include <cstring>
 #include <cinttypes>
 #include <cstdio>
+#include <csignal>
 #include <chrono>
 #include <optional>
 #include <charconv>
 #include <algorithm>
 #include <random>
+
+static std::atomic_bool running{true};
+
+static void signal_handler(int) {
+    running.store(false, std::memory_order_relaxed);
+}
 
 #ifdef NO_GPU
 constexpr bool no_gpu = true;
@@ -244,7 +251,10 @@ int main_inner(int argc, char **argv) {
     }
 #endif
 
-    for (size_t i = 0;; i++) {
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    for (size_t i = 0; running.load(std::memory_order_relaxed); i++) {
         if (threads != 0) {
             std::lock_guard lock(cpu_outputs.mutex);
             while (!cpu_outputs.queue.empty()) {
@@ -264,9 +274,19 @@ int main_inner(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
+    std::printf("\nShutting down...\n");
+
 #ifndef NO_GPU
     for (auto &thread : gpu_threads) {
         (*thread).stop();
+    }
+    std::printf("Waiting for GPU batches to finish...\n");
+    for (auto &thread : gpu_threads) {
+        (*thread).join();
+    }
+    {
+        uint64_t total_seeds_checked = seed_range.pos.load(std::memory_order_relaxed) - start_seed;
+        std::printf("Start seed: %" PRIi64 ", Total seeds checked: %" PRIu64 "\n", start_seed, total_seeds_checked);
     }
 #endif
 #ifndef NO_CPU
@@ -283,11 +303,6 @@ int main_inner(int argc, char **argv) {
     }
 #endif
 
-#ifndef NO_GPU
-    for (auto &thread : gpu_threads) {
-        (*thread).join();
-    }
-#endif
 #ifndef NO_CPU
     for (auto &thread : cpu_threads) {
         (*thread).join();
